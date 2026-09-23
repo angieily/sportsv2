@@ -1,0 +1,36 @@
+{
+  "play_by_play_2026.parquet": {
+    "bytes": 2498674
+  },
+  "basketball_player_logs.csv.gz": {
+    "bytes": 2169058,
+    "rows": 98160,
+    "columns": 25
+  },
+  "nfl_rosters.csv.gz": {
+    "bytes": 896696,
+    "rows": 101445,
+    "columns": 18
+  },
+  "play_by_play_2025.parquet": {
+    "bytes": 20337029
+  },
+  "nfl_games.csv.gz": {
+    "bytes": 32160,
+    "rows": 842,
+    "columns": 35
+  },
+  "nfl_snap_counts.csv.gz": {
+    "bytes": 1066050,
+    "rows": 56221,
+    "columns": 16
+  },
+  "play_by_play_2024.parquet": {
+    "bytes": 20597560
+  },
+  "nfl_player_weekly.csv.gz": {
+    "bytes": 2199643,
+    "rows": 40630,
+    "columns": 58
+  }
+}

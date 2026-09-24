@@ -32,7 +32,7 @@ from sklearn.calibration import calibration_curve
 # ============================================================
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "v35-verified-player-logs-prop-table-fast-scan"
+BUILD_ID = "v37-live-sportsbook-props-verified-market-scan"
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -2749,6 +2749,400 @@ def american_to_implied(odds):
     if o < 0:
         return (-o) / ((-o) + 100.0)
     return 100.0 / (o + 100.0)
+
+
+# ============================================================
+# V37: THE ODDS API — LIVE PLAYER PROP MARKETS
+# ============================================================
+
+ODDS_API_SPORT_KEYS={
+    "NBA":"basketball_nba",
+    "WNBA":"basketball_wnba",
+    "NFL":"americanfootball_nfl",
+}
+
+# Keep this to <=10 bookmakers so The Odds API treats it as one bookmaker group.
+# This includes major US books plus Hard Rock Bet Florida when that book publishes
+# the requested market. Availability still varies by game/market.
+ODDS_API_BOOKMAKERS=[
+    "draftkings","fanduel","betmgm","betrivers",
+    "betonlineag","bovada","hardrockbet_fl","espnbet",
+]
+
+ODDS_API_MARKETS={
+    "NBA":[
+        "player_points","player_rebounds","player_assists","player_threes",
+        "player_points_rebounds_assists","player_points_rebounds",
+        "player_points_assists","player_rebounds_assists",
+    ],
+    "WNBA":[
+        "player_points","player_rebounds","player_assists","player_threes",
+        "player_points_rebounds_assists","player_points_rebounds",
+        "player_points_assists","player_rebounds_assists",
+    ],
+    "NFL":[
+        "player_pass_yds","player_pass_tds","player_pass_interceptions",
+        "player_rush_yds","player_rush_attempts",
+        "player_reception_yds","player_receptions","player_reception_tds",
+    ],
+}
+
+ODDS_API_MARKET_TO_PROP={
+    "player_points":"Points",
+    "player_rebounds":"Rebounds",
+    "player_assists":"Assists",
+    "player_threes":"3-Pointers Made",
+    "player_points_rebounds_assists":"PRA",
+    "player_points_rebounds":"PR",
+    "player_points_assists":"PA",
+    "player_rebounds_assists":"RA",
+    "player_pass_yds":"Passing Yards",
+    "player_pass_tds":"Passing TDs",
+    "player_pass_interceptions":"Interceptions Thrown",
+    "player_rush_yds":"Rushing Yards",
+    "player_rush_attempts":"Rushing Attempts",
+    "player_reception_yds":"Receiving Yards",
+    "player_receptions":"Receptions",
+    "player_reception_tds":"Receiving TDs",
+}
+
+
+def get_the_odds_api_key():
+    key=str(os.getenv("THE_ODDS_API_KEY","") or "").strip()
+    if not key:
+        try:
+            key=str(st.secrets.get("THE_ODDS_API_KEY","") or "").strip()
+        except Exception:
+            key=""
+    return key
+
+
+def _odds_team_key_v37(value):
+    return re.sub(r"[^a-z0-9]","",unicodedata.normalize("NFKD",str(value or "")).encode("ascii","ignore").decode("ascii").lower())
+
+
+def _odds_team_tokens_v37(value):
+    s=unicodedata.normalize("NFKD",str(value or "")).encode("ascii","ignore").decode("ascii").lower()
+    return [x for x in re.findall(r"[a-z0-9]+",s) if x]
+
+
+def _odds_team_match_score_v37(a,b):
+    ka,kb=_odds_team_key_v37(a),_odds_team_key_v37(b)
+    if ka and ka==kb:
+        return 1.0
+    ta,tb=_odds_team_tokens_v37(a),_odds_team_tokens_v37(b)
+    if not ta or not tb:
+        return 0.0
+    # Mascot/team nickname is usually the final token and is highly stable
+    # across ESPN vs sportsbook naming conventions (e.g. LA vs Los Angeles).
+    if ta[-1]==tb[-1]:
+        return 0.90
+    sa,sb=set(ta),set(tb)
+    overlap=len(sa & sb)/max(1,len(sa | sb))
+    if overlap>=.66:
+        return .82
+    if ka in kb or kb in ka:
+        return .72
+    return overlap*.65
+
+
+def _odds_api_get_v37(url,params,timeout=10):
+    """Single-request Odds API helper. Never retries an HTTP error and burns credits twice."""
+    try:
+        r=requests.get(url,params=params,timeout=timeout)
+    except Exception as e:
+        return None,{},f"The Odds API request failed: {e}"
+    meta={
+        "remaining":r.headers.get("x-requests-remaining"),
+        "used":r.headers.get("x-requests-used"),
+        "last":r.headers.get("x-requests-last"),
+    }
+    if r.status_code>=400:
+        detail=""
+        try:
+            payload=r.json()
+            detail=str(payload.get("message") or payload.get("error") or payload)
+        except Exception:
+            detail=r.text[:300]
+        return None,meta,f"The Odds API HTTP {r.status_code}: {detail}"
+    try:
+        return r.json(),meta,None
+    except Exception as e:
+        return None,meta,f"The Odds API returned invalid JSON: {e}"
+
+
+@st.cache_data(ttl=300,show_spinner=False)
+def fetch_the_odds_events_v37(league,api_key):
+    sport=ODDS_API_SPORT_KEYS.get(str(league).upper())
+    if not sport:
+        return [],{},f"Unsupported league for live props: {league}"
+    if not api_key:
+        return [],{},"THE_ODDS_API_KEY is not configured in Streamlit Secrets."
+    url=f"https://api.the-odds-api.com/v4/sports/{sport}/events"
+    payload,meta,err=_odds_api_get_v37(url,{"apiKey":api_key,"dateFormat":"iso"},timeout=8)
+    if err:
+        return [],meta,err
+    return payload if isinstance(payload,list) else [],meta,None
+
+
+def match_the_odds_event_v37(game,events):
+    if not events:
+        return None,"The Odds API returned no live/upcoming events for this league."
+    gh=str(game.get("home_name") or game.get("home_abbr") or "")
+    ga=str(game.get("away_name") or game.get("away_abbr") or "")
+    selected=st.session_state.get("selected_date",date.today())
+    sd=pd.to_datetime(selected,errors="coerce",utc=True)
+    best=None; best_score=-1.0
+    for ev in events:
+        hs=_odds_team_match_score_v37(gh,ev.get("home_team",""))
+        as_=_odds_team_match_score_v37(ga,ev.get("away_team",""))
+        if hs<.70 or as_<.70:
+            continue
+        score=hs+as_
+        et=pd.to_datetime(ev.get("commence_time"),errors="coerce",utc=True)
+        if not pd.isna(sd) and not pd.isna(et):
+            day_gap=abs((et.normalize()-sd.normalize()).days)
+            score-=min(day_gap,7)*.06
+        if score>best_score:
+            best_score=score; best=ev
+    if best is None:
+        return None,(
+            "Could not safely match the selected ESPN game to a live Odds API event. "
+            "The app will not guess a different game."
+        )
+    return best,None
+
+
+@st.cache_data(ttl=300,show_spinner=False)
+def fetch_the_odds_event_props_v37(league,event_id,api_key):
+    sport=ODDS_API_SPORT_KEYS.get(str(league).upper())
+    markets=ODDS_API_MARKETS.get(str(league).upper(),[])
+    if not sport or not markets:
+        return {},{},f"No live prop market map is configured for {league}."
+    if not api_key:
+        return {},{},"THE_ODDS_API_KEY is not configured in Streamlit Secrets."
+    url=f"https://api.the-odds-api.com/v4/sports/{sport}/events/{event_id}/odds"
+    params={
+        "apiKey":api_key,
+        "bookmakers":",".join(ODDS_API_BOOKMAKERS),
+        "markets":",".join(markets),
+        "oddsFormat":"american",
+        "dateFormat":"iso",
+    }
+    payload,meta,err=_odds_api_get_v37(url,params,timeout=12)
+    if err:
+        return {},meta,err
+    return payload if isinstance(payload,dict) else {},meta,None
+
+
+def _best_american_price_v37(rows):
+    valid=[r for r in rows if not pd.isna(safe_float(r.get("price")))]
+    if not valid:
+        return np.nan,""
+    best=max(valid,key=lambda r:float(safe_float(r.get("price"))))
+    return float(safe_float(best.get("price"))),str(best.get("book") or "")
+
+
+def parse_the_odds_props_v37(payload,league,roster):
+    """Normalize sportsbook props and require an exact selected-game roster identity match."""
+    if not payload or roster is None or roster.empty:
+        return [],[{"Status":"No live props","Detail":"No sportsbook payload or selected-game roster was available."}]
+    r=roster.copy()
+    r["_player_key_v37"]=r.get("player",pd.Series("",index=r.index)).map(_name_key)
+    # Duplicate normalized names in one selected-game roster are ambiguous; do not guess.
+    counts=r["_player_key_v37"].value_counts()
+    unique_keys=set(counts[counts==1].index)
+    rmap={k:r[r["_player_key_v37"]==k].iloc[0] for k in unique_keys if k}
+    entries=[]; diagnostics=[]
+    supported=set(ODDS_API_MARKETS.get(str(league).upper(),[]))
+    for book in payload.get("bookmakers",[]) or []:
+        bkey=str(book.get("key") or "")
+        btitle=str(book.get("title") or bkey or "Book")
+        for market in book.get("markets",[]) or []:
+            mkey=str(market.get("key") or "")
+            if mkey not in supported or mkey not in ODDS_API_MARKET_TO_PROP:
+                continue
+            prop=ODDS_API_MARKET_TO_PROP[mkey]
+            for outcome in market.get("outcomes",[]) or []:
+                side=str(outcome.get("name") or "").title()
+                if side not in {"Over","Under"}:
+                    continue
+                pname=str(outcome.get("description") or "").strip()
+                pkey=_name_key(pname)
+                if not pname or pkey not in rmap:
+                    diagnostics.append({
+                        "Status":"Unmatched sportsbook player",
+                        "Detail":f"{pname or 'Unnamed player'} ({prop}) was not an exact unique match in the selected-game roster; skipped.",
+                    })
+                    continue
+                point=safe_float(outcome.get("point")); price=safe_float(outcome.get("price"))
+                if pd.isna(point) or pd.isna(price):
+                    continue
+                rr=rmap[pkey]
+                entries.append({
+                    "player":str(rr.get("player",pname)),"player_key":pkey,
+                    "team":str(rr.get("team_abbr","")).upper(),
+                    "team_id":str(rr.get("team_id","")),"position":str(rr.get("position","")),
+                    "athlete_id":str(rr.get("athlete_id","")),"player_id":str(rr.get("player_id","")),
+                    "market_key":mkey,"stat":prop,"side":side,"line":float(point),"price":float(price),
+                    "book":btitle,"book_key":bkey,"last_update":market.get("last_update") or book.get("last_update") or "",
+                })
+    return entries,diagnostics
+
+
+def consensus_live_prop_markets_v37(entries):
+    """Collapse books to the most commonly posted line per player/stat, with de-vig consensus."""
+    if not entries:
+        return []
+    df=pd.DataFrame(entries)
+    out=[]
+    for (pkey,stat),g in df.groupby(["player_key","stat"],dropna=False):
+        # Prefer the line posted by the largest number of distinct books.
+        line_counts=(g.groupby("line")["book_key"].nunique().sort_values(ascending=False))
+        if line_counts.empty:
+            continue
+        maxn=line_counts.iloc[0]
+        candidates=sorted([float(x) for x,v in line_counts.items() if v==maxn])
+        line=float(candidates[len(candidates)//2])
+        z=g[np.isclose(pd.to_numeric(g["line"],errors="coerce"),line)].copy()
+        paired=[]
+        for bkey,bg in z.groupby("book_key"):
+            ovs=bg[bg["side"]=="Over"]; uns=bg[bg["side"]=="Under"]
+            if ovs.empty or uns.empty:
+                continue
+            op=safe_float(ovs.iloc[0].get("price")); up=safe_float(uns.iloc[0].get("price"))
+            oi,ui=american_to_implied(op),american_to_implied(up)
+            if pd.isna(oi) or pd.isna(ui) or oi+ui<=0:
+                continue
+            paired.append({"over":oi/(oi+ui),"under":ui/(oi+ui),"book":str(bg.iloc[0].get("book",""))})
+        first=z.iloc[0]
+        for side in ["Over","Under"]:
+            sr=z[z["side"]==side]
+            if sr.empty:
+                continue
+            best_price,best_book=_best_american_price_v37(sr.to_dict("records"))
+            raw_probs=[american_to_implied(x) for x in pd.to_numeric(sr["price"],errors="coerce").dropna().tolist()]
+            raw_probs=[x for x in raw_probs if not pd.isna(x)]
+            if paired:
+                fair=float(np.mean([x[side.lower()] for x in paired]))
+            else:
+                fair=float(np.median(raw_probs)) if raw_probs else np.nan
+            out.append({
+                "Player":str(first.get("player","")),"Team":str(first.get("team","")),
+                "Team ID":str(first.get("team_id","")),"Position":str(first.get("position","")),
+                "Athlete ID":str(first.get("athlete_id","")),"Player ID":str(first.get("player_id","")),
+                "Stat":stat,"Market key":str(first.get("market_key","")),"Side":side,"Line value":line,
+                "Best odds":best_price,"Best book":best_book,"Market probability":fair,
+                "Break-even":american_to_implied(best_price),"Books":int(sr["book_key"].nunique()),
+                "Consensus books":len(paired),
+                "Last update":str(sr["last_update"].dropna().max() if "last_update" in sr.columns and not sr.empty else ""),
+            })
+    return out
+
+
+def scan_live_sportsbook_props_v37(game,league,roster,ctx,progress_cb=None):
+    key=get_the_odds_api_key()
+    if not key:
+        return [],[],{},"THE_ODDS_API_KEY is missing from Streamlit Secrets."
+    if progress_cb:
+        progress_cb(0,4,"","matching selected game")
+    events,emeta,eerr=fetch_the_odds_events_v37(league,key)
+    if eerr:
+        return [],[],emeta,eerr
+    event,merr=match_the_odds_event_v37(game,events)
+    if merr:
+        return [],[],emeta,merr
+    if progress_cb:
+        progress_cb(1,4,"","fetching current sportsbook player props")
+    payload,pmeta,perr=fetch_the_odds_event_props_v37(league,str(event.get("id","")),key)
+    meta={**emeta,**{k:v for k,v in pmeta.items() if v is not None},"event":event}
+    if perr:
+        return [],[],meta,perr
+    entries,diagnostics=parse_the_odds_props_v37(payload,league,roster)
+    markets=consensus_live_prop_markets_v37(entries)
+    if not markets:
+        return [],diagnostics,meta,"No verified current player over/under props were returned for this game."
+
+    # Fetch each team injury feed once. Historical evaluation stays local for speed.
+    injury_cache={}
+    for team_id in roster.get("team_id",pd.Series(dtype=str)).astype(str).unique():
+        if team_id:
+            injury_cache[team_id]=fetch_injuries(league,team_id,game.get("event_id",""))
+
+    ideas=[]
+    player_cache={}
+    total=len(markets)
+    for i,mkt in enumerate(markets,1):
+        pname=str(mkt["Player"]); team=str(mkt["Team"]); side=str(mkt["Side"])
+        if progress_cb:
+            progress_cb(2+i/max(total,1),4,pname,f"checking {mkt['Stat']} {side.lower()} {mkt['Line value']:g}")
+        cache_key=(_name_key(pname),team.upper())
+        base=player_cache.get(cache_key)
+        if base is None:
+            match=roster[(roster["player"].map(_name_key)==_name_key(pname)) & (roster["team_abbr"].astype(str).str.upper()==team.upper())]
+            if len(match)!=1:
+                diagnostics.append({"Player":pname,"Status":"Identity check failed","Detail":"Current sportsbook player did not resolve to exactly one selected-game roster row."})
+                player_cache[cache_key]={"error":True}
+                continue
+            row=match.iloc[0]
+            d=_full_player_game_data(game,league,row,fast_scan=True)
+            if d.get("error") or d["log"].empty:
+                diagnostics.append({"Player":pname,"Status":"No verified history","Detail":str(d.get("error") or "No local stat-bearing player history.")})
+                player_cache[cache_key]={"error":True}
+                continue
+            props=available_props(d["log"],league)
+            today_side="home" if team==game.get("home_abbr") else "away"
+            injuries,inj_err=injury_cache.get(str(row.get("team_id","")),(pd.DataFrame(),"No injury source"))
+            team_ctx=(ctx or {}).get(today_side,{})
+            if league=="NFL":
+                workload=nfl_workload_info_v33(d["log"],injuries,pname,injury_verified=team_ctx.get("injury_verified",inj_err is None))
+                workload_text=nfl_workload_summary_text_v33(workload)
+            else:
+                workload=estimate_player_availability_minutes(d["log"],injuries,pname,injury_verified=team_ctx.get("injury_verified",inj_err is None))
+                workload_text=minutes_summary_text(workload)
+            base={"error":False,"row":row,"d":d,"props":props,"today_side":today_side,"team_ctx":team_ctx,"workload":workload,"workload_text":workload_text}
+            player_cache[cache_key]=base
+        if base.get("error"):
+            continue
+        row=base["row"]; d=base["d"]; props=base["props"]; today_side=base["today_side"]; team_ctx=base["team_ctx"]; workload=base["workload"]; workload_text=base["workload_text"]
+        stat=str(mkt["Stat"])
+        if stat not in props:
+            diagnostics.append({"Player":pname,"Status":"Unsupported stat","Detail":f"Verified local history did not contain the columns needed for {stat}."})
+            continue
+        analysis=easy_prop_analysis(
+            d["log"],d["matchup"],league,props[stat],side,float(mkt["Line value"]),
+            market_probability=mkt.get("Market probability"),current_side=today_side,opponent=d["opponent"],
+        )
+        fit=player_vs_team_fit(game,league,d["log"],pname,d["position"],d["opponent"],stat)
+        quality=research_data_quality(d["log"],d["matchup"],team_ctx.get("injury_verified",False),workload,analysis)
+        flags=automatic_red_flags(d["log"],d["matchup"],workload,analysis)
+        model_p=analysis.get("probability",np.nan)
+        fair=mkt.get("Market probability",np.nan); be=mkt.get("Break-even",np.nan)
+        ideas.append({
+            "Player":pname,"Team":team,"Position":d["position"],"Opponent":d["opponent"],
+            "Stat":stat,"Line":f"{side} {float(mkt['Line value']):g}","Line value":float(mkt["Line value"]),"Market side":side,
+            "Model probability":model_p,"Last 10":analysis.get("last10",np.nan),"Last 20":analysis.get("last20",np.nan),
+            "Vs opponent":analysis.get("vs_opponent",np.nan),"Backtest N":analysis.get("backtest_n",0),"Brier":analysis.get("brier",np.nan),
+            "Minutes":workload_text,"Data quality":quality["label"],"Data quality score":quality["score"],
+            "Helps":fit["helps"],"Hurts":fit["hurts"],"Player strengths":fit["player_strengths"],"Player weaknesses":fit["player_weaknesses"],
+            "Opponent weaknesses":fit["opponent_weaknesses"],"Opponent strengths":fit["opponent_strengths"],"Red flags":flags,
+            "Volatility":"Supported","Live market":True,"Market probability":fair,"Break-even":be,
+            "Market edge":(model_p-fair if not pd.isna(model_p) and not pd.isna(fair) else np.nan),
+            "Price edge":(model_p-be if not pd.isna(model_p) and not pd.isna(be) else np.nan),
+            "Best odds":mkt.get("Best odds",np.nan),"Best book":mkt.get("Best book",""),"Books":mkt.get("Books",0),
+            "Consensus books":mkt.get("Consensus books",0),"Market key":mkt.get("Market key",""),"Odds event ID":str(event.get("id","")),
+            "Odds event":f"{event.get('away_team','')} at {event.get('home_team','')}","Odds last update":mkt.get("Last update",""),
+            "Market verdict":analysis.get("verdict",""),"Market verdict text":analysis.get("verdict_text",""),
+        })
+    if progress_cb:
+        progress_cb(4,4,"","ranking real sportsbook lines")
+    # Market edge first, then evidence quality. Negative/unknown edges stay at the bottom.
+    ideas=sorted(ideas,key=lambda r:(
+        -float(r.get("Market edge",-9) if not pd.isna(r.get("Market edge",np.nan)) else -9),
+        -int(r.get("Data quality score",0) or 0),
+        -float(r.get("Model probability",0) if not pd.isna(r.get("Model probability",np.nan)) else 0),
+    ))
+    return ideas,diagnostics,meta,None
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_espn_moneyline_consensus(league, event_id):
@@ -7388,15 +7782,25 @@ def quick_support_score(row):
         if "no clear" not in str(x).lower()
     )
 
+    market_bonus=0.0
+    if row.get("Live market"):
+        edge=row.get("Market edge",np.nan)
+        price_edge=row.get("Price edge",np.nan)
+        if not pd.isna(edge):
+            market_bonus += .22*max(-.15,min(.15,float(edge)))/.15
+        if not pd.isna(price_edge):
+            market_bonus += .08*max(-.15,min(.15,float(price_edge)))/.15
+
     return (
-        .36*p
-        + .16*l10
-        + .08*opp
-        + .16*q
-        + .18*agree
+        .31*p
+        + .14*l10
+        + .07*opp
+        + .14*q
+        + .16*agree
         + .025*min(helps,3)
         - .03*min(hurts,3)
         - .035*min(red,3)
+        + market_bonus
     )
 
 def rank_quick_ideas(ideas):
@@ -7422,6 +7826,14 @@ def rank_quick_ideas(ideas):
 
 def quick_idea_reasons(row):
     reasons=[]
+
+    if row.get("Live market"):
+        edge=row.get("Market edge",np.nan)
+        pe=row.get("Price edge",np.nan)
+        if not pd.isna(edge) and edge>0:
+            reasons.append(f"model is {edge*100:.1f} percentage points above the de-vigged sportsbook consensus for this exact line")
+        if not pd.isna(pe) and pe>0:
+            reasons.append(f"model is {pe*100:.1f} points above the break-even probability at the best current price")
 
     l10=row.get("Last 10",np.nan)
     if not pd.isna(l10) and l10>=.60:
@@ -7494,6 +7906,22 @@ def quick_idea_label(row):
     ):
         return "HOLD OFF","warning"
 
+    if row.get("Live market"):
+        edge=row.get("Market edge",np.nan)
+        price_edge=row.get("Price edge",np.nan)
+        if (
+            not pd.isna(p) and not pd.isna(edge)
+            and p>=.55 and float(edge)>=.04
+            and agreement>=5 and q in {"HIGH","MEDIUM"}
+            and (pd.isna(price_edge) or float(price_edge)>=.015)
+        ):
+            return "LIVE MARKET EDGE — STRONGER SUPPORT","success"
+        if not pd.isna(edge) and float(edge)>=.02 and not pd.isna(p) and p>=.53:
+            return "LIVE LINE — SOME SUPPORT","info"
+        if not pd.isna(edge) and float(edge)<=0:
+            return "MARKET AT/ABOVE MODEL — WEAK / PASS","warning"
+        return "LIVE LINE — TOO CLOSE / MORE RISK","warning"
+
     if (
         not pd.isna(p)
         and p>=.64
@@ -7537,206 +7965,195 @@ def _fresh_selected_game(game,league):
     fresh["schedule_date"]=selected_date
     return fresh,None
 
+def refresh_live_market_for_idea_v37(game,league,roster,idea):
+    if not idea.get("Live market"):
+        return None,{},None
+    key=get_the_odds_api_key()
+    if not key:
+        return None,{},"THE_ODDS_API_KEY is not configured."
+    event_id=str(idea.get("Odds event ID","") or "")
+    meta={}
+    if not event_id:
+        events,emeta,eerr=fetch_the_odds_events_v37(league,key)
+        meta.update(emeta)
+        if eerr:
+            return None,meta,eerr
+        event,merr=match_the_odds_event_v37(game,events)
+        if merr:
+            return None,meta,merr
+        event_id=str(event.get("id","") or "")
+        meta["event"]=event
+    payload,pmeta,perr=fetch_the_odds_event_props_v37(league,event_id,key)
+    meta.update({k:v for k,v in pmeta.items() if v is not None})
+    if perr:
+        return None,meta,perr
+    entries,diagnostics=parse_the_odds_props_v37(payload,league,roster)
+    markets=consensus_live_prop_markets_v37(entries)
+    player_key=_name_key(idea.get("Player",""))
+    stat=str(idea.get("Stat",""))
+    side=str(idea.get("Market side","") or "")
+    same=[m for m in markets if _name_key(m.get("Player",""))==player_key and str(m.get("Stat",""))==stat and str(m.get("Side",""))==side]
+    if not same:
+        return None,meta,"The exact player/stat/side is no longer posted by the queried sportsbooks."
+    old_line=safe_float(idea.get("Line value"))
+    if pd.isna(old_line):
+        mm=re.search(r"(\d+(?:\.\d+)?)",str(idea.get("Line","")))
+        old_line=float(mm.group(1)) if mm else np.nan
+    if not pd.isna(old_line):
+        exact=[m for m in same if abs(float(m.get("Line value",np.nan))-float(old_line))<1e-9]
+        if exact:
+            return exact[0],meta,None
+        same=sorted(same,key=lambda m:abs(float(m.get("Line value",0))-float(old_line)))
+    return same[0],meta,None
+
+
 def final_check_game_idea(game,league,roster,idea):
-    """
-    Fresh single-idea recheck immediately before the user acts.
-    Re-fetches schedule/injuries/player log and recomputes the same line.
-    """
-    # The user explicitly asked for a fresh final check; clear cached live data.
-    st.cache_data.clear()
+    """Fresh single-idea verification without clearing the heavy local-data caches."""
+    # Clear only live endpoints that matter to this exact recheck. Do NOT clear
+    # the bundled CSV/parquet caches; that was making the app unnecessarily slow.
+    for fn in [
+        fetch_schedule,fetch_injuries,fetch_the_odds_events_v37,fetch_the_odds_event_props_v37,
+        fetch_nba_player_by_name,fetch_wnba_player_by_name,fetch_espn_player_gamelog_multi,
+    ]:
+        try:
+            fn.clear()
+        except Exception:
+            pass
 
     fresh_game,err=_fresh_selected_game(game,league)
     if err:
-        return {
-            "status":"COULD NOT VERIFY",
-            "kind":"warning",
-            "messages":[err],
-        }
+        return {"status":"COULD NOT VERIFY","kind":"warning","messages":[err]}
 
     fresh_ctx=build_matchup_context(fresh_game,league)
-
-    player=str(idea["Player"])
-    team=str(idea["Team"])
+    player=str(idea["Player"]); team=str(idea["Team"])
     match=roster[
-        (roster["player"].astype(str)==player)
-        & (roster["team_abbr"].astype(str)==team)
+        (roster["player"].map(_name_key)==_name_key(player))
+        & (roster["team_abbr"].astype(str).str.upper()==team.upper())
     ]
-    if match.empty:
+    if len(match)!=1:
         return {
-            "status":"COULD NOT VERIFY",
-            "kind":"warning",
-            "messages":["Player could not be matched to the loaded roster."],
+            "status":"COULD NOT VERIFY","kind":"warning",
+            "messages":["Player could not be matched to exactly one loaded roster identity."],
         }
 
     row=match.iloc[0]
-    d=_full_player_game_data(
-        fresh_game,league,row
-    )
+    d=_full_player_game_data(fresh_game,league,row)
     if d.get("error") or d["log"].empty:
         return {
-            "status":"COULD NOT VERIFY",
-            "kind":"warning",
-            "messages":[
-                str(d.get("error") or "Fresh player game log was unavailable.")
-            ],
+            "status":"COULD NOT VERIFY","kind":"warning",
+            "messages":[str(d.get("error") or "Fresh player game log was unavailable.")],
         }
 
     props=available_props(d["log"],league)
-    stat=idea["Stat"]
+    stat=str(idea["Stat"])
     if stat not in props:
         return {
-            "status":"COULD NOT VERIFY",
-            "kind":"warning",
+            "status":"COULD NOT VERIFY","kind":"warning",
             "messages":[f"Fresh player data no longer returned the {stat} field."],
         }
 
-    m=re.search(r"(\d+(?:\.\d+)?)",str(idea["Line"]))
-    if not m:
-        return {
-            "status":"COULD NOT VERIFY",
-            "kind":"warning",
-            "messages":["Could not parse the saved prop line."],
-        }
-    line=float(m.group(1))
+    mm=re.search(r"(\d+(?:\.\d+)?)",str(idea.get("Line","")))
+    if not mm:
+        return {"status":"COULD NOT VERIFY","kind":"warning","messages":["Could not parse the saved prop line."]}
+    old_line=float(mm.group(1))
+    side=str(idea.get("Market side") or ("Under" if str(idea.get("Line","")).lower().startswith("under") else "Over" if str(idea.get("Line","")).lower().startswith("over") else "At least (X+)"))
+    line=old_line
+    market_probability=None
+    fresh_market=None
+    market_meta={}
+    market_err=None
+    if idea.get("Live market"):
+        fresh_market,market_meta,market_err=refresh_live_market_for_idea_v37(fresh_game,league,roster,idea)
+        if fresh_market:
+            line=float(fresh_market.get("Line value",old_line))
+            market_probability=fresh_market.get("Market probability",np.nan)
 
+    side_key="home" if team==fresh_game["home_abbr"] else "away"
     analysis=easy_prop_analysis(
-        d["log"],
-        d["matchup"],
-        league,
-        props[stat],
-        "At least (X+)",
-        line,
-        market_probability=None,
-        current_side=(
-            "home"
-            if team==fresh_game["home_abbr"]
-            else "away"
-        ),
-        opponent=d["opponent"],
+        d["log"],d["matchup"],league,props[stat],side,line,
+        market_probability=market_probability,
+        current_side=side_key,opponent=d["opponent"],
     )
 
-    injuries,inj_err=fetch_injuries(
-        league,d["team_id"]
-    )
-    side_key=(
-        "home"
-        if team==fresh_game["home_abbr"]
-        else "away"
-    )
+    injuries,inj_err=fetch_injuries(league,d["team_id"],fresh_game.get("event_id",""))
     team_ctx=fresh_ctx.get(side_key,{})
-    minutes=estimate_player_availability_minutes(
-        d["log"],
-        injuries,
-        player,
-        injury_verified=team_ctx.get(
-            "injury_verified",inj_err is None
-        ),
-    )
+    if league=="NFL":
+        workload=nfl_workload_info_v33(d["log"],injuries,player,injury_verified=team_ctx.get("injury_verified",inj_err is None))
+        workload_text=nfl_workload_summary_text_v33(workload)
+    else:
+        workload=estimate_player_availability_minutes(d["log"],injuries,player,injury_verified=team_ctx.get("injury_verified",inj_err is None))
+        workload_text=minutes_summary_text(workload)
 
-    fresh_fit=player_vs_team_fit(
-        fresh_game,
-        league,
-        d["log"],
-        player,
-        d["position"],
-        d["opponent"],
-        stat,
-    )
-
-    quality=research_data_quality(
-        d["log"],
-        d["matchup"],
-        team_ctx.get("injury_verified",False),
-        minutes,
-        analysis,
-    )
+    fresh_fit=player_vs_team_fit(fresh_game,league,d["log"],player,d["position"],d["opponent"],stat)
+    quality=research_data_quality(d["log"],d["matchup"],team_ctx.get("injury_verified",False),workload,analysis)
 
     messages=[]
-    old_p=idea.get("Model probability",np.nan)
-    new_p=analysis.get("probability",np.nan)
+    old_p=idea.get("Model probability",np.nan); new_p=analysis.get("probability",np.nan)
+    messages.append(f"Fresh estimated probability: {fmt_pct(new_p)} (previous scan: {fmt_pct(old_p)}).")
+    messages.append(("Fresh workload / availability: " if league=="NFL" else "Fresh minutes / availability: ")+workload_text)
+    messages.append(f"Fresh data quality: {quality['label']} ({quality['score']}/100).")
 
-    messages.append(
-        f"Fresh estimated probability: {fmt_pct(new_p)} "
-        f"(previous scan: {fmt_pct(old_p)})."
-    )
-    messages.append(
-        "Fresh minutes / availability: "
-        + minutes_summary_text(minutes)
-    )
-    messages.append(
-        f"Fresh data quality: {quality['label']} ({quality['score']}/100)."
-    )
+    if idea.get("Live market"):
+        if fresh_market:
+            best=fresh_market.get("Best odds",np.nan)
+            messages.append(
+                f"Fresh sportsbook market: {side} {line:g} {stat} at "
+                + ("—" if pd.isna(best) else f"{float(best):+.0f}")
+                + f" ({fresh_market.get('Best book','—')}); de-vigged consensus {fmt_pct(fresh_market.get('Market probability'))}."
+            )
+            if abs(line-old_line)>1e-9:
+                messages.append(f"Player prop line moved: {old_line:g} → {line:g}.")
+            old_best=idea.get("Best odds",np.nan)
+            if not pd.isna(old_best) and not pd.isna(best) and float(old_best)!=float(best):
+                messages.append(f"Best price moved: {float(old_best):+.0f} → {float(best):+.0f}.")
+            edge=analysis.get("edge",np.nan)
+            if not pd.isna(edge):
+                messages.append(f"Fresh model-vs-market difference: {float(edge)*100:+.1f} percentage points.")
+            rem=market_meta.get("remaining")
+            if rem not in [None,""]:
+                messages.append(f"Odds API credits remaining after this refresh: {rem}.")
+        elif market_err:
+            messages.append("Live sportsbook recheck: "+str(market_err))
 
-    # Detect team-line movement. This is context, not proof of sharp money.
-    old_odds=game.get("odds") or {}
-    new_odds=fresh_game.get("odds") or {}
-    old_detail=old_odds.get("details")
-    new_detail=new_odds.get("details")
-    old_total=old_odds.get("total")
-    new_total=new_odds.get("total")
-
+    # Team-line movement is secondary context.
+    old_odds=game.get("odds") or {}; new_odds=fresh_game.get("odds") or {}
+    old_detail=old_odds.get("details"); new_detail=new_odds.get("details")
+    old_total=old_odds.get("total"); new_total=new_odds.get("total")
     if old_detail and new_detail and old_detail!=new_detail:
-        messages.append(
-            f"Game line changed: {old_detail} → {new_detail}."
-        )
-    if (
-        not pd.isna(old_total)
-        if old_total is not None
-        else False
-    ) and (
-        not pd.isna(new_total)
-        if new_total is not None
-        else False
-    ) and float(old_total)!=float(new_total):
-        messages.append(
-            f"Game total changed: {old_total} → {new_total}."
-        )
+        messages.append(f"Game line changed: {old_detail} → {new_detail}.")
+    if old_total is not None and new_total is not None and not pd.isna(safe_float(old_total)) and not pd.isna(safe_float(new_total)) and float(safe_float(old_total))!=float(safe_float(new_total)):
+        messages.append(f"Game total changed: {old_total} → {new_total}.")
 
-    status=str(minutes.get("status",""))
+    status=str(workload.get("status",""))
+    fresh_edge=analysis.get("edge",np.nan)
     if status.startswith("OUT"):
-        final="HOLD UP — PLAYER OUT"
-        kind="error"
-    elif status in {
-        "QUESTIONABLE / DAY-TO-DAY",
-        "DOUBTFUL",
-        "INJURY STATUS NOT VERIFIED",
-    }:
-        final="HOLD UP — AVAILABILITY UNCERTAIN"
-        kind="warning"
-    elif minutes.get("restriction"):
-        final="HOLD UP — MINUTES RESTRICTION"
-        kind="warning"
+        final="HOLD UP — PLAYER OUT"; kind="error"
+    elif status in {"QUESTIONABLE / DAY-TO-DAY","DOUBTFUL","INJURY STATUS NOT VERIFIED"}:
+        final="HOLD UP — AVAILABILITY UNCERTAIN"; kind="warning"
+    elif workload.get("restriction"):
+        final="HOLD UP — WORKLOAD RESTRICTION"; kind="warning"
+    elif idea.get("Live market") and fresh_market is None:
+        final="LIVE MARKET NO LONGER VERIFIED"; kind="warning"
+    elif idea.get("Live market") and not pd.isna(fresh_edge) and float(fresh_edge)<=0:
+        final="MARKET EDGE NO LONGER PRESENT"; kind="warning"
     elif not pd.isna(new_p) and new_p<.55:
-        final="SUPPORT WEAKENED"
-        kind="warning"
-    elif (
-        not pd.isna(old_p)
-        and not pd.isna(new_p)
-        and float(old_p)-float(new_p)>=.08
-    ):
-        final="SUPPORT DROPPED — REVIEW AGAIN"
-        kind="warning"
+        final="SUPPORT WEAKENED"; kind="warning"
+    elif not pd.isna(old_p) and not pd.isna(new_p) and float(old_p)-float(new_p)>=.08:
+        final="SUPPORT DROPPED — REVIEW AGAIN"; kind="warning"
     else:
-        final="NOTHING IMPORTANT CHANGED"
-        kind="success"
+        final="CURRENT CHECK STILL SUPPORTS THE RESEARCH"; kind="success"
 
-    # Include one fresh style note in final check.
     for x in fresh_fit.get("helps",[]):
         if "no clear" not in str(x).lower():
-            messages.append("Matchup still helps: "+str(x))
-            break
+            messages.append("Matchup still helps: "+str(x)); break
     for x in fresh_fit.get("hurts",[]):
         if "no clear" not in str(x).lower():
-            messages.append("Main fresh matchup concern: "+str(x))
-            break
+            messages.append("Main fresh matchup concern: "+str(x)); break
 
     return {
-        "status":final,
-        "kind":kind,
-        "messages":messages,
+        "status":final,"kind":kind,"messages":messages,
         "checked_at":datetime.now().strftime("%I:%M %p"),
-        "fresh_game":fresh_game,
-        "fresh_ctx":fresh_ctx,
+        "fresh_game":fresh_game,"fresh_ctx":fresh_ctx,
     }
 
 def save_quick_idea_to_watchlist(row,league):
@@ -7916,11 +8333,18 @@ def v20_injury_summary(ctx,side):
     )
 
 def v20_top_game_ideas(ideas):
-    supported=[
-        dict(x)
-        for x in ideas
-        if x.get("Volatility")=="Supported"
-    ]
+    supported=[dict(x) for x in ideas if x.get("Volatility")=="Supported"]
+    if any(x.get("Live market") for x in supported):
+        # A live-market Find a Bet result must have an actual positive discrepancy;
+        # high historical hit rate by itself is not enough to promote a line.
+        supported=[
+            x for x in supported
+            if not pd.isna(x.get("Market edge",np.nan))
+            and float(x.get("Market edge"))>=.02
+            and not pd.isna(x.get("Price edge",np.nan))
+            and float(x.get("Price edge"))>0
+            and str(x.get("Data quality","")).upper() in {"HIGH","MEDIUM"}
+        ]
     for row in supported:
         row["_score"]=quick_support_score(row)
         row["_agreement"]=quick_idea_agreement(row)[0]
@@ -7929,11 +8353,8 @@ def v20_top_game_ideas(ideas):
         key=lambda r:(
             -r["_score"],
             -r["_agreement"],
-            -float(
-                0
-                if pd.isna(r.get("Model probability",np.nan))
-                else r.get("Model probability",0)
-            ),
+            -float(0 if pd.isna(r.get("Market edge",np.nan)) else r.get("Market edge",0)),
+            -float(0 if pd.isna(r.get("Model probability",np.nan)) else r.get("Model probability",0)),
         ),
     )
 
@@ -12322,7 +12743,7 @@ if page=="👤 Player Report":
 if page=="🔍 Find a Bet":
     st.subheader("🔍 Find a Bet")
     st.write(
-        "This scans the selected game from the verified local player database first. It does not make dozens of live player requests; a Final check refreshes the exact shortlisted idea."
+        "This pulls the current sportsbook player-prop lines for the selected game, then checks those exact lines against the verified local player database. The broad scan stays local after the one market fetch; Final check refreshes the exact shortlisted player and market."
     )
 
     game=st.session_state.get("matchup")
@@ -12343,55 +12764,83 @@ if page=="🔍 Find a Bet":
             f"# {game['away_name']} at {game['home_name']}"
         )
 
+        if not get_the_odds_api_key():
+            st.warning("THE_ODDS_API_KEY is not configured in Streamlit Secrets, so live player-prop scanning is unavailable.")
+
         if st.button(
-            "Scan every player in this game",
+            "Fetch & scan current sportsbook props",
             type="primary",
             use_container_width=True,
+            disabled=not bool(get_the_odds_api_key()),
         ):
-            scan_status=st.status("⏳ Preparing verified player scan...",expanded=True)
+            scan_status=st.status("⏳ Matching this game to current sportsbook markets...",expanded=True)
             scan_progress=st.progress(0.0)
             scan_line=st.empty()
-            def _scan_progress_v35(i,total,name,stage):
+            def _scan_progress_v37(i,total,name,stage):
                 frac=0.0 if not total else min(1.0,max(0.0,float(i)/float(total)))
                 scan_progress.progress(frac)
                 if name:
-                    scan_line.caption(f"{stage.title()}: {name} ({i}/{total})")
+                    scan_line.caption(f"{stage.title()}: {name}")
                 else:
                     scan_line.caption(stage.title())
-            ideas,diagnostics,total=scan_every_player_for_game(
-                game,league,roster,ctx,progress_cb=_scan_progress_v35
+            ideas,diagnostics,odds_meta,scan_err=scan_live_sportsbook_props_v37(
+                game,league,roster,ctx,progress_cb=_scan_progress_v37
             )
-            scan_status.update(label="✅ Verified-history scan complete",state="complete",expanded=False)
-            scan_progress.progress(1.0)
             ranked=v20_top_game_ideas(ideas)
-            st.session_state[
-                "full_game_ideas"
-            ]=ideas
-            st.session_state[
-                "full_game_scan_diagnostics"
-            ]=diagnostics
-            st.session_state[
-                "full_game_scan_total"
-            ]=total
-            st.session_state[
-                "quick_ranked_ideas"
-            ]=ranked
+            st.session_state["full_game_ideas"]=ideas
+            st.session_state["full_game_scan_diagnostics"]=diagnostics
+            st.session_state["full_game_scan_total"]=len(ideas)
+            st.session_state["quick_ranked_ideas"]=ranked
+            st.session_state["live_props_meta_v37"]=odds_meta
+            st.session_state["live_props_error_v37"]=scan_err or ""
+            if scan_err:
+                scan_status.update(label="⚠️ Live prop scan could not be completed",state="error",expanded=True)
+            else:
+                scan_status.update(label="✅ Current sportsbook lines checked against verified player history",state="complete",expanded=False)
+            scan_progress.progress(1.0)
 
-        ranked=st.session_state.get(
-            "quick_ranked_ideas",[]
-        )
+        ranked=st.session_state.get("quick_ranked_ideas",[])
+        odds_meta=st.session_state.get("live_props_meta_v37",{}) or {}
+        scan_err=st.session_state.get("live_props_error_v37","")
+        if scan_err:
+            st.warning(scan_err)
+        if odds_meta.get("event"):
+            ev=odds_meta["event"]
+            quota=odds_meta.get("remaining")
+            qtxt=f" • API credits remaining: {quota}" if quota not in [None,""] else ""
+            st.caption(
+                f"Live market matched: {ev.get('away_team','')} at {ev.get('home_team','')} • "
+                f"sportsbook lines cached for 5 minutes{qtxt}."
+            )
         if "quick_ranked_ideas" in st.session_state:
-            st.caption("Broad scan = verified local history for speed/reliability. Use Final check on an idea to refresh current live player/availability context before relying on it.")
+            st.caption("Only exact player identities from the selected-game roster are allowed into the scan. Historical calculations use verified local logs for speed; live market price and line come from The Odds API.")
 
         if "quick_ranked_ideas" not in st.session_state:
-            st.caption(
-                "Press the button once. The research pages do not auto-pick bets; this page does."
-            )
+            st.caption("Press the button once to fetch the current offered player props and evaluate those exact lines.")
         elif not ranked:
             st.warning(
-                "### 🚫 No player prop passed the stronger-support filter\n\n"
-                "The app will not force a pick."
+                "### 🚫 No current sportsbook prop cleared the promotion filter\n\n"
+                "The app checked the real posted lines but will not force a pick when the model-vs-market difference, price, data quality, or availability is not strong enough."
             )
+            _all_checked=st.session_state.get("full_game_ideas",[]) or []
+            if _all_checked:
+                _rows=[]
+                for _r in _all_checked[:20]:
+                    _best=_r.get("Best odds",np.nan)
+                    _edge=_r.get("Market edge",np.nan)
+                    _rows.append({
+                        "Player":_r.get("Player"),
+                        "Prop":f"{_r.get('Line','')} {_r.get('Stat','')}",
+                        "Best price":("—" if pd.isna(_best) else f"{float(_best):+.0f}"),
+                        "Book":_r.get("Best book",""),
+                        "Model":fmt_pct(_r.get("Model probability")),
+                        "Sportsbook fair":fmt_pct(_r.get("Market probability")),
+                        "Difference":("—" if pd.isna(_edge) else f"{float(_edge)*100:+.1f} pts"),
+                        "Last 10":fmt_pct(_r.get("Last 10")),
+                        "Quality":_r.get("Data quality","—"),
+                    })
+                st.markdown("### Closest current lines checked")
+                st.dataframe(pd.DataFrame(_rows),use_container_width=True,hide_index=True)
         else:
             st.markdown("## ⭐ Strongest player-prop ideas")
             for rank,row in enumerate(
@@ -12430,6 +12879,24 @@ if page=="🔍 Find a Bet":
                     "Data quality",
                     row.get("Data quality","—"),
                 )
+
+                if row.get("Live market"):
+                    m1,m2,m3,m4=st.columns(4)
+                    _best=row.get("Best odds",np.nan)
+                    m1.metric(
+                        "Best current price",
+                        "—" if pd.isna(_best) else f"{float(_best):+.0f}",
+                        help=str(row.get("Best book","") or "Sportsbook"),
+                    )
+                    m2.metric("Sportsbook fair",fmt_pct(row.get("Market probability")))
+                    _me=row.get("Market edge",np.nan)
+                    m3.metric("Model vs market","—" if pd.isna(_me) else f"{float(_me)*100:+.1f} pts")
+                    _pe=row.get("Price edge",np.nan)
+                    m4.metric("Model vs break-even","—" if pd.isna(_pe) else f"{float(_pe)*100:+.1f} pts")
+                    st.caption(
+                        f"Best book: {row.get('Best book','—')} • books at this line: {row.get('Books',0)} • "
+                        f"paired books used to de-vig consensus: {row.get('Consensus books',0)} • market update: {row.get('Odds last update','—')}"
+                    )
 
                 if kind=="success":
                     st.success(label)
@@ -12553,6 +13020,12 @@ if page=="🔍 Find a Bet":
                         st.write("• "+msg)
 
                 st.divider()
+
+        _diag=st.session_state.get("full_game_scan_diagnostics",[]) or []
+        if _diag:
+            with st.expander("Verification / skipped market rows"):
+                st.caption("These rows were excluded instead of guessed when player identity, stat history, or sportsbook data could not be verified.")
+                st.dataframe(pd.DataFrame(_diag).drop_duplicates(),use_container_width=True,hide_index=True)
 
         st.markdown("## 🏆 Team winner research")
         team=team_win_research(

@@ -32,7 +32,7 @@ from sklearn.calibration import calibration_curve
 # ============================================================
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "v37-live-sportsbook-props-verified-market-scan"
+BUILD_ID = "v38-injury-fallback-live-sportsbook-props"
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -1124,9 +1124,12 @@ def injury_counts(df):
     x=clean_injury_rows(df)
     if x.empty:
         return {"total":0,"out":0,"questionable":0}
-    status=x["Status"].astype(str).str.lower() if "Status" in x.columns else pd.Series("",index=x.index)
-    out=int(status.str.contains("out|injured reserve|\\bir\\b|doubtful",regex=True).sum())
-    questionable=int(status.str.contains("questionable|game-time|day-to-day|day to day",regex=True).sum())
+    status=x["Status"].fillna("").astype(str).str.lower() if "Status" in x.columns else pd.Series("",index=x.index)
+    # ESPN may return full words, fantasy abbreviations, or enum-like strings.
+    out_pat=r"(^|\b)(out|o|doubtful|d|injured reserve|ir|pup|reserve injured)(\b|$)|injury_status_out|injury_status_doubtful"
+    q_pat=r"(^|\b)(questionable|q|game-time|game time|day-to-day|day to day)(\b|$)|injury_status_questionable"
+    out=int(status.str.contains(out_pat,regex=True,na=False).sum())
+    questionable=int(status.str.contains(q_pat,regex=True,na=False).sum())
     return {"total":len(x),"out":out,"questionable":questionable}
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -4374,7 +4377,7 @@ def render_matchup_breakdown_v11(game,league,ctx):
             if not inj.empty:
                 show=[
                     c for c in
-                    ["Player","Status","Injury","Detail","ReturnDate"]
+                    ["Player","Status","Injury","Detail","ReturnDate","Source"]
                     if c in inj.columns
                 ]
                 st.dataframe(inj[show].head(15),use_container_width=True,hide_index=True)
@@ -8393,7 +8396,7 @@ def v20_render_injuries(game,ctx):
             if inj is not None and not inj.empty:
                 show=[
                     c for c in
-                    ["Player","Status","Injury","Detail","ReturnDate"]
+                    ["Player","Status","Injury","Detail","ReturnDate","Source"]
                     if c in inj.columns
                 ]
                 st.dataframe(
@@ -11135,42 +11138,195 @@ def fetch_event_injuries_v23(league,event_id,team_id=""):
     return df,None
 
 
+def _espn_injury_group_team_id_v39(group):
+    """Read ESPN team identity across league-specific injury payload shapes."""
+    if not isinstance(group,dict):
+        return ""
+    direct=group.get("id") or group.get("teamId") or group.get("teamID")
+    if direct not in [None,""]:
+        return str(direct)
+    team=group.get("team") or {}
+    if isinstance(team,dict):
+        val=team.get("id") or team.get("teamId") or team.get("teamID")
+        if val not in [None,""]:
+            return str(val)
+    return ""
+
+
+def _espn_injury_group_team_name_v39(group):
+    if not isinstance(group,dict):
+        return ""
+    team=group.get("team") or {}
+    if isinstance(team,dict):
+        return str(team.get("displayName") or team.get("name") or "")
+    return str(group.get("displayName") or group.get("name") or "")
+
+
+def _injury_rows_from_items_v39(items,fallback_team_id="",fallback_team_name=""):
+    """Normalize ESPN injury rows and keep group-level team identity when athlete.team is omitted."""
+    rows=[]
+    for obj in items or []:
+        if not isinstance(obj,dict):
+            continue
+        athlete=obj.get("athlete") or {}
+        status=obj.get("status") or ""
+        if isinstance(status,dict):
+            status=(status.get("name") or status.get("description") or status.get("type") or status.get("abbreviation") or "")
+        details=obj.get("details") or {}
+        typ=obj.get("type") or {}
+        if not status and isinstance(details,dict):
+            fs=details.get("fantasyStatus") or {}
+            if isinstance(fs,dict):
+                status=fs.get("description") or fs.get("abbreviation") or ""
+        if not status and isinstance(typ,dict):
+            status=typ.get("description") or typ.get("abbreviation") or typ.get("name") or ""
+        team=athlete.get("team") or {}
+        team_id=str(team.get("id","") or fallback_team_id or "") if isinstance(team,dict) else str(fallback_team_id or "")
+        team_name=(team.get("displayName") or team.get("name") or fallback_team_name or "") if isinstance(team,dict) else str(fallback_team_name or "")
+        rows.append({
+            "Player":athlete.get("displayName") or athlete.get("fullName") or "",
+            "Status":status or "",
+            "Detail":obj.get("shortComment") or obj.get("detail") or "",
+            "LongComment":obj.get("longComment") or "",
+            "Date":obj.get("date") or "",
+            "Injury":details.get("type") if isinstance(details,dict) else "",
+            "Side":details.get("side") if isinstance(details,dict) else "",
+            "ReturnDate":details.get("returnDate") if isinstance(details,dict) else "",
+            "AthleteID":str(athlete.get("id","") or ""),
+            "TeamID":team_id,
+            "Team":team_name,
+        })
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_injuries(league,team_id,event_id=""):
-    """Fast verified injury lookup with fallback calls only when needed."""
-    cfg=LEAGUES[league]; team_id=str(team_id); messages=[]
+    """
+    Cross-league verified injury lookup for NBA, WNBA and NFL.
+
+    Important reliability rules:
+    - ESPN uses different league-wide group shapes. WNBA/NBA can expose group.id,
+      while NFL commonly exposes group.team.id. Both are handled.
+    - A successful-but-empty team endpoint is NEVER treated as proof of zero injuries.
+    - Empty structured responses fail closed as "not verified" instead of displaying 0.
+    - Any returned row must resolve to the exact selected team by TeamID or roster identity.
+    """
+    cfg=LEAGUES[league]
+    team_id=str(team_id)
+    messages=[]
+    positive=[]
+
+    def _verified(df,source,force_team_id=False,force_team_name=""):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        x=df.copy()
+        if force_team_id:
+            if "TeamID" not in x.columns:
+                x["TeamID"]=team_id
+            else:
+                ids=x["TeamID"].fillna("").astype(str).str.strip()
+                x.loc[ids.eq(""),"TeamID"]=team_id
+            if force_team_name:
+                if "Team" not in x.columns:
+                    x["Team"]=force_team_name
+                else:
+                    names=x["Team"].fillna("").astype(str).str.strip()
+                    x.loc[names.eq(""),"Team"]=force_team_name
+        out=_filter_injuries_to_team(x,league,team_id)
+        if out is None or out.empty:
+            return pd.DataFrame()
+        out=clean_injury_rows(out)
+        out["Source"]=source
+        return out
+
+    # 1) Exact team endpoint. Non-empty rows are accepted only after team verification.
     team_url=f"https://site.api.espn.com/apis/site/v2/sports/{cfg['sport']}/{cfg['league']}/teams/{team_id}/injuries"
     try:
-        payload=request_json(team_url,timeout=7); frames=[]
+        payload=request_json(team_url,timeout=7)
+        frames=[]
         direct=payload.get("injuries") if isinstance(payload,dict) else None
         if isinstance(direct,list):
-            d=_injury_rows_from_items(direct)
-            if not d.empty: d["Source"]="ESPN team injury feed"; frames.append(d)
-        found=[]; _walk_injuries(payload,found); d=pd.DataFrame(found)
-        if not d.empty: d["Source"]="ESPN team injury feed"; frames.append(d)
+            d=_injury_rows_from_items_v39(direct,fallback_team_id=team_id)
+            if not d.empty: frames.append(d)
+        found=[]; _walk_injuries(payload,found)
+        if found:
+            d=pd.DataFrame(found)
+            if not d.empty: frames.append(d)
         if frames:
-            out=pd.concat(frames,ignore_index=True,sort=False)
-            if "Player" in out.columns:
-                out["_key"]=out["Player"].map(_name_key)
-                out["_score"]=(out.get("Status",pd.Series("",index=out.index)).astype(str).str.len()>0).astype(int)*2 + (out.get("Detail",pd.Series("",index=out.index)).astype(str).str.len()>0).astype(int)
-                out=out.sort_values("_score",ascending=False).drop_duplicates("_key").drop(columns=["_key","_score"],errors="ignore")
-            return out,None
-        return pd.DataFrame(),None
-    except Exception as e: messages.append(f"team feed: {e}")
-    if event_id:
-        d,e=fetch_event_injuries_v23(league,event_id,team_id)
-        if e: messages.append(e)
-        else: return d,None
+            d=_verified(pd.concat(frames,ignore_index=True,sort=False),"ESPN team injury feed",force_team_id=True)
+            if not d.empty: positive.append(d)
+        else:
+            messages.append("team feed returned no injury rows")
+    except Exception as e:
+        messages.append(f"team feed: {e}")
+
+    # 2) League-wide endpoint. ESPN payload shape differs by league, so support
+    # both {id: TEAM_ID, injuries:[...]} and {team:{id: TEAM_ID}, injuries:[...]}.
     league_url=f"https://site.api.espn.com/apis/site/v2/sports/{cfg['sport']}/{cfg['league']}/injuries"
+    league_team_seen=False
     try:
-        payload=request_json(league_url,timeout=7); groups=payload.get("injuries") or []
-        matched=next((g for g in groups if isinstance(g,dict) and str(g.get("id",""))==team_id),None)
-        if matched is not None:
-            d=_injury_rows_from_items(matched.get("injuries") or [])
-            if not d.empty: d["Source"]="ESPN league injury feed"
-            return d,None
-    except Exception as e: messages.append(f"league feed: {e}")
-    return pd.DataFrame(),"Injury/availability could not be verified from the available ESPN feeds. " + " | ".join(messages)
+        payload=request_json(league_url,timeout=7)
+        groups=(payload.get("injuries") or []) if isinstance(payload,dict) else []
+        matches=[g for g in groups if isinstance(g,dict) and _espn_injury_group_team_id_v39(g)==team_id]
+        if matches:
+            league_team_seen=True
+            frames=[]
+            for g in matches:
+                gname=_espn_injury_group_team_name_v39(g)
+                d=_injury_rows_from_items_v39(g.get("injuries") or [],fallback_team_id=team_id,fallback_team_name=gname)
+                if not d.empty: frames.append(d)
+            if frames:
+                d=_verified(pd.concat(frames,ignore_index=True,sort=False),"ESPN league injury feed",force_team_id=True)
+                if not d.empty: positive.append(d)
+            else:
+                messages.append("league feed found the team but returned no injury rows")
+        else:
+            # Some variants do not group cleanly. Walk the payload and preserve
+            # only rows that can be tied to this exact team.
+            found=[]; _walk_injuries(payload,found)
+            d=_verified(pd.DataFrame(found),"ESPN league injury feed") if found else pd.DataFrame()
+            if not d.empty:
+                positive.append(d)
+            else:
+                messages.append("league feed did not expose a verifiable selected-team group")
+    except Exception as e:
+        messages.append(f"league feed: {e}")
+
+    # 3) Selected-game summary can add same-week/game designations. It is merged
+    # with the team/league results rather than replacing them.
+    if event_id:
+        try:
+            d,e=fetch_event_injuries_v23(league,event_id,team_id)
+            if e:
+                messages.append("game summary: "+str(e))
+            elif d is not None and not d.empty:
+                d=_verified(d,"ESPN game summary")
+                if not d.empty: positive.append(d)
+            else:
+                messages.append("game summary returned no verifiable injury rows")
+        except Exception as e:
+            messages.append(f"game summary: {e}")
+
+    if positive:
+        out=pd.concat(positive,ignore_index=True,sort=False)
+        out=clean_injury_rows(out)
+        # Prefer rows with a concrete designation/detail if multiple sources have
+        # the same athlete. clean_injury_rows already handles date preference;
+        # this final sort makes current designations easier to audit in the UI.
+        if "Status" in out.columns:
+            out["_status_score"]=(out["Status"].fillna("").astype(str).str.strip().ne("")).astype(int)
+            out=out.sort_values("_status_score",ascending=False).drop(columns="_status_score",errors="ignore")
+        return out.reset_index(drop=True),None
+
+    # Do NOT return (empty, None). That combination is interpreted by the rest of
+    # the app as "verified zero". With live injury data, missing rows are safer
+    # than a false 0, so every league fails closed here.
+    note=" | ".join(dict.fromkeys([m for m in messages if m]))
+    if league_team_seen:
+        base="No current injury rows were returned for this team, but zero injuries were not independently verified."
+    else:
+        base="Injury/availability could not be verified for this team from the current ESPN feeds."
+    return pd.DataFrame(),base+(" "+note if note else "")
 
 def _active_season_month_v36(league,ref_date):
     d=pd.Timestamp(ref_date).date() if not isinstance(ref_date,date) else ref_date
